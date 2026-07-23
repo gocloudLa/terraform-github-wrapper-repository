@@ -1,0 +1,214 @@
+---
+description: GoCloud conventions for all terraform-github-wrapper-* repos.
+alwaysApply: true
+---
+
+# GoCloud GitHub wrappers — conventions
+
+## Context
+
+GoCloud builds Terraform **wrapper modules** for GitHub organization management (`terraform-github-wrapper-*`). Each wrapper either:
+- **Wraps GitHub provider resources** behind a `*_parameters` / `*_defaults` contract with `for_each` or an enable gate, opinionated defaults, and complementary resources, or
+- **Develops a custom child module** under `modules/` when the logic needs typed variables, locals, or multi-resource orchestration.
+
+Typical stack order: Organization → Team → Repository (and related concerns).
+
+---
+
+## Repo layout
+
+Root files / dirs (always present):
+
+```
+.github/           # dependabot.yml + workflows (pull-request-events, push-events, scheduled)
+.gitignore
+CHANGELOG.md
+LICENSE
+versions.tf        # required_version + required_providers (integrations/github)
+variables.tf       # metadata + <service>_parameters + <service>_defaults
+metadata.tf        # frozen — provides local.common_name, local.common_tags, local.metadata
+locals.tf          # only wrapper-level derived values (may be empty locals { })
+data_sources.tf    # only data sources referenced from other .tf files (may be empty)
+main.tf            # module blocks
+outputs.tf         # caller-facing outputs only
+README.yml         # source of truth for generated README
+examples/complete/ # lab example
+modules/           # child module(s)
+```
+
+For complex wrappers, split complementary resource groups into `_<concern>.tf` files (e.g. `_webhooks.tf`, `_memberships.tf`) — do not pack everything into `main.tf`.
+
+Child modules live under `modules/terraform-github-<service>/` (or `modules/github/terraform-github-<service>/` when grouping by provider).
+
+Copy `.github/` from an existing `terraform-*-wrapper-*` repo (same Dependabot + shared reusable workflows). Do not invent ad-hoc CI.
+
+---
+
+## Variables — contract
+
+```hcl
+/*--- Common ---*/
+variable "metadata" { type = any }
+
+/*--- <Service> ---*/
+variable "<service>_parameters" {
+  type        = any
+  description = "<One line: what this map configures.>"
+  default     = {}
+}
+
+variable "<service>_defaults" {
+  type        = any
+  description = "Default values merged into each entry of <service>_parameters."
+  default     = {}
+}
+```
+
+- `type = any` **only** for top-level parameter maps (`*_parameters`, `*_defaults`, `metadata`).
+- One-line descriptions; no multi-sentence explanations in `variables.tf`.
+- No new root-level knobs (owner, token, org name as standalone vars, etc.) — use `metadata` and `*_parameters`. Configure the GitHub provider in the calling stack / example.
+- Additional context variables are allowed when the wrapper consumes outputs from another wrapper (e.g. team IDs, org slug).
+- Submodule variables stay **typed** (`string`, `bool`, `map(string)`, etc.); `any` only for open shapes (rulesets, nested objects, policy-like maps).
+
+---
+
+## `metadata.tf` — frozen
+
+Never modify `metadata.tf`. It is a platform template that provides `local.common_name`, `local.common_tags`, and `local.metadata`. Copy it from an existing wrapper unchanged; adapt only if the platform template itself changes.
+
+GitHub resources generally do **not** take AWS-style `tags`; keep `metadata.tf` for platform consistency and naming, but do not invent a `tags =` argument on provider resources that do not support it.
+
+---
+
+## Core pattern — `for_each` + `try()` chain
+
+When iterating over a map of resources, `for_each` may be placed directly on `var.<service>_parameters` or on a local that pre-merges defaults:
+
+```hcl
+# Option A — direct (no local normalization needed)
+module "<service>" {
+  source = "./modules/terraform-github-<service>"
+
+  for_each = var.<service>_parameters
+
+  some_field = try(each.value.some_field, var.<service>_defaults.some_field, <hardcoded_default>)
+}
+
+# Option B — local normalization (when defaults must be merged before resolving derived values)
+locals {
+  <service>s = {
+    for k, v in var.<service>_parameters :
+    k => merge(var.<service>_defaults, v)
+  }
+}
+module "<service>" {
+  for_each   = local.<service>s
+  some_field = try(each.value.some_field, <hardcoded_default>)
+}
+```
+
+**`try()` chain always follows:** `try(each.value.field, var.<service>_defaults.field, <hardcoded_default>)`.
+Never use `lookup()` or `coalesce(try(…, null), default)`.
+
+When the wrapper manages a **single** toggled resource (not a map of instances), use an enable gate named `enable_<service>` + `count`, and read fields from the parameters map (not `each.value`):
+
+```hcl
+locals {
+  <service>_enable = try(var.<service>_parameters.enable_<service>, false) ? 1 : 0
+}
+
+module "<service>" {
+  source = "./modules/terraform-github-<service>"
+  count  = local.<service>_enable
+
+  some_field = try(var.<service>_parameters.some_field, var.<service>_defaults.some_field, <hardcoded_default>)
+}
+```
+
+Examples: `enable`, `enable_identity_center` (AWS). Prefer this over a bare `enable` key.
+
+Some wrappers iterate over a **sub-key** of the parameters map when the service has multiple resource types:
+```hcl
+for_each = try(var.<service>_parameters.role, {})
+```
+
+---
+
+## `locals.tf` — minimal
+
+Keep only what the root must compute once: derived names, feature gates, cross-resource lookups, data expansion. No child-module business logic here. Keep an empty `locals { }` block when there is nothing to derive (file still present).
+
+```hcl
+locals {
+  # Feature gate (only when the wrapper manages a single toggled resource)
+  <service>_enable = try(var.<service>_parameters.enable_<service>, false) ? 1 : 0
+}
+```
+
+---
+
+## HCL idioms
+
+- `try(…)` for all optional key reads from `any` maps — never `lookup`.
+- `&&` does **not** short-circuit — guard nullable operands with a ternary or intermediate local.
+- Compatible with both Terraform ≥ 1.10 and OpenTofu — avoid `regexreplace` and other non-portable built-ins.
+- Cross-field validation in child modules: `lifecycle { precondition { … } }` or `variable` `validation` blocks.
+- Prefer `integrations/github` `>= 6.0` unless a resource requires a newer minor.
+
+---
+
+## Outputs
+
+Export only IDs, names, slugs, URLs, or maps a parent stack or another wrapper will consume.
+Use `try(module.child[0].output, null)` when the child uses `count`.
+For `for_each` children, prefer a map keyed by the same keys as `*_parameters`.
+Skip debug outputs.
+
+---
+
+## Examples (`examples/complete/`)
+
+```
+versions.tf
+providers.tf      # provider "github" { owner = local.metadata.github_owner }
+metadata.tf       # local.metadata with non-secret placeholders (+ common_name)
+locals.tf         # may be empty
+data_sources.tf   # may be empty
+variables.tf      # same parameter variables as the wrapper (metadata commented)
+main.tf           # module "wrapper_<service>" { source = "../../" … }
+outputs.tf
+README.yml
+```
+
+- Assignment syntax only: `<service>_parameters = { … }` — never block syntax.
+- No real org names, tokens, emails, usernames, or secrets: use placeholders such as `"example-org"`, `"user1-example"`, `"billing@example.com"`, `"123456789012"`.
+- Comment non-default overrides with `# Default: <value>`.
+- Set `provider "github" { owner = local.metadata.github_owner }` from example metadata — do not hardcode production owners.
+
+---
+
+## Documentation
+
+`README.yml` is the source of truth for the registry / generated README.
+Do not maintain a hand-written root `README.md` if the pipeline generates it from YAML.
+
+---
+
+## Anti-patterns
+
+| Avoid | Prefer |
+|-------|--------|
+| `lookup(map, k, d)` | `try(map.k, d)` |
+| `coalesce(try(…, null), d)` | `try(…, d)` |
+| Bare `enable` on single-resource wrappers | `enable_<service>` |
+| Missing `.github/` workflows | copy from an existing wrapper |
+| AWS-style `tags =` on GitHub resources | omit; use topics/labels only when the resource supports them |
+| Root-level `owner` / `token` variables | provider config in the caller / example |
+| `&&` with nullable operand | ternary or intermediate local |
+| `any` for scalar submodule vars | explicit type |
+| Unused `data` blocks | delete |
+| Block syntax for map variables | `= { }` assignment |
+| Long variable `description` | one line |
+| Business logic in wrapper locals | move to child module |
+| Modifying `metadata.tf` | copy frozen; never edit |
+| Real identities in examples | placeholders only |
